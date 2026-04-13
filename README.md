@@ -99,8 +99,8 @@ Generated personalized timetable:
 
 ## Future Improvements
 
-- graphical user interface
+- Graphical user interface
 - PDF export
-- configurable input and output filenames
-- support for other semesters
-- support for other faculties
+- Configurable input and output filenames
+- Support for other semesters
+- Support for other faculties
