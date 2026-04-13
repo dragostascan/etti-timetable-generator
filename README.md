@@ -32,6 +32,14 @@ This project automates the process of cleaning the official Excel file, extracti
 - `Generator Orar ETTI.docx` - Romanian project documentation
 - `requirements.txt` - project dependencies
 
+## Documentation
+
+A more detailed Romanian-language project documentation is available in this repository as:
+
+- `Generator Orar ETTI.docx`
+
+It includes the project overview, technical challenges, implementation details, usage instructions, limitations, and possible future improvements.
+
 ## How to Run
 
 ### 1. Install dependencies
