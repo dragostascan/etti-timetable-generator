@@ -295,8 +295,21 @@ def este_curs(text):
     return "(curs)" in t or "(c)" in t
 
 def este_activitate_sport(text):
-    t = scoate_sala_din_text(text).lower()
-    return "sport" in t or "educatie fizica" in t or "educaţie fizică" in t or "sp(s)" in t
+    t = scoate_sala_din_text(text).lower().strip()
+    t = re.sub(r'\s+', ' ', t)
+
+    variante_sport = {
+        "sport",
+        "sport (s)",
+        "sp(s)",
+        "sp (s)",
+        "educatie fizica",
+        "educaţie fizică",
+        "educatie fizica si sport 2",
+        "educaţie fizică şi sport 2"
+    }
+
+    return t in variante_sport
 
 def sala_de_sport(sala_text):
     s = str(sala_text).lower()
@@ -417,8 +430,12 @@ def extrage_sali_laborator(fisier_curatat, nume_sheet_anunturi, grupa_cautata, t
         for prescurtare, nume_lung in traducator_activ.items():
             p_norm = normalize_key(prescurtare)
             n_norm = normalize_key(nume_lung)
-            if n_norm in disciplina_bruta or p_norm in disciplina_bruta:
-                # Salveaza sala sub AMBELE nume (si cel scurt, si cel lung)
+
+            # Evitam potriviri periculoase pe randuri mixte de tip "Fizica / Sport"
+            if '/' in disciplina_bruta:
+                continue
+            # Salvam si numele scurt si numele lung
+            if disciplina_bruta == n_norm or disciplina_bruta == p_norm:
                 dictionar_sali[p_norm] = sala
                 dictionar_sali[n_norm] = sala
 
@@ -520,8 +537,8 @@ def detecteaza_coloana_sala(df, col_sga, grupa_cautata):
             room_count = 0
             for r in range(8, min(40, len(df))):
                 cell_val = normalize_text(df.iloc[r, c])
-                # Verifica printr-un filtru regex daca celula arata a sala (ex: Litera + Cifre = "B125", "A05")
-                if re.match(r'^[A-Z]\s*\d{2,3}[a-z]?$', cell_val, re.IGNORECASE):
+                # Verifica printr-un filtru regex daca celula arata a sala (ex: Litera + Cifre = "B125", "A05", "BN030")
+                if re.match(r'^[A-Z]{1,3}\s*\d{2,4}[A-Z]?$', cell_val.strip(), re.IGNORECASE):
                     room_count += 1
             if room_count >= 2: return c # Daca gaseste minim 2, nu este o coincidenta
             
@@ -617,8 +634,18 @@ def ataseaza_salile_finale(grila, dictionar_sali, traducator_activ):
                     continue
 
                 if este_activitate_sport(mat) and not materia_are_sala(mat):
-                    e[sg][par] = f"{mat} [Sala Sport LEU]"
-                    continue
+                    if scoate_sala_din_text(mat).lower().strip() in {
+                        "sport",
+                        "sport (s)",
+                        "sp(s)",
+                        "sp (s)",
+                        "educatie fizica",
+                        "educaţie fizică",
+                        "educatie fizica si sport 2",
+                        "educaţie fizică şi sport 2"
+                    }:
+                        e[sg][par] = f"{mat} [Sala Sport LEU]"
+                        continue
 
                 if materia_are_sala(mat): continue
 
@@ -900,7 +927,7 @@ def exporteaza_in_excel(orar_baza, optionale_alese, grupa, semigrupa_utilizator)
     creeaza_sheet_paritate(wb, orar_baza, optionale_alese, grupa, semigrupa_utilizator, are_sg2, "Saptamana_Impara", "Impara", stil)
     creeaza_sheet_paritate(wb, orar_baza, optionale_alese, grupa, semigrupa_utilizator, are_sg2, "Saptamana_Para", "Para", stil)
 
-    nume_fisier_iesire = f"Orar_Personalizat_{grupa}.xlsx"
+    nume_fisier_iesire = f"Orar_Personalizat_{grupa}{semigrupa_utilizator}.xlsx"
     wb.save(nume_fisier_iesire)
     print(f"\nOrarul a fost generat si salvat ca '{nume_fisier_iesire}'!")
 
