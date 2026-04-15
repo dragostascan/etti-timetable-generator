@@ -435,7 +435,7 @@ def extrage_sali_laborator(fisier_curatat, nume_sheet_anunturi, grupa_cautata, t
             if '/' in disciplina_bruta:
                 continue
             # Salvam si numele scurt si numele lung
-            if disciplina_bruta == n_norm or disciplina_bruta == p_norm:
+            if n_norm in disciplina_bruta or p_norm in disciplina_bruta:
                 dictionar_sali[p_norm] = sala
                 dictionar_sali[n_norm] = sala
 
