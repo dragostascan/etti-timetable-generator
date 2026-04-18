@@ -108,7 +108,7 @@ Generated personalized timetable:
 ## Future Improvements
 
 - Graphical user interface
-- PDF export
+- Google Calendar export
 - Configurable input and output filenames
 - Support for other semesters
 - Support for other faculties
