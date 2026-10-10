@@ -1,3 +1,6 @@
+import os
+import sys
+import difflib
 import pandas as pd
 import re
 from collections import Counter
@@ -11,6 +14,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 # dar în grila de "Orar" scrie prescurtat ("fiz2 (l)"). Aceste dicționare fac legătura între ele.
 
 TRADUCATOR_RO = {
+    
     # ================= ANUL 1 =================
     "fiz2 (l)": "Fizică",
     "fiz2(l)": "Fizică",
@@ -64,6 +68,8 @@ TRADUCATOR_RO = {
     "mic (l)": "Microprocesoare (Microprocessors)",
     "mic(l)": "Microprocesoare (Microprocessors)",
     "pr apm": "Aplicatii practice ale microcontrolerelor - Proiect",
+    "uU (l)": "Microunde",
+    "uU(l)": "Microunde",
 
     # ================= ANUL 4 =================
     "cm (l)": "COMUNICAŢII MOBILE",
@@ -141,6 +147,10 @@ TRADUCATOR_EN = {
     "bsad (l)": "Bazele sistemelor de achiziție de date",
     "tdav(l)": "Tehnici digitale audio video",
     "tdav (l)": "Tehnici digitale audio video",
+    "ia (l) SC2": "ARTIFICIAL INTELLIGENCE",
+    "ia(l) SC2": "ARTIFICIAL INTELLIGENCE",
+    "uU (l)": "Microunde",
+    "uU(l)": "Microunde",
     
     # ================= ANUL 4 =================
     "robo (l)": "Robotica",
@@ -315,53 +325,244 @@ def sala_de_sport(sala_text):
     s = str(sala_text).lower()
     return "sport" in s or "sala sport" in s
 
-def seria_se_potriveste(serii_text, grupa_cautata):
-    # Citeste textul "A, C, G" din foaia de anunturi si verifica daca apartii listei
-    serii_text = normalize_text(serii_text).upper()
-    grupa_cautata = str(grupa_cautata).strip().upper()
-    
-    # Extrage doar litera seriei
-    seria_mea = ""
-    for char in reversed(grupa_cautata):
-        if char.isalpha():
-            seria_mea = char
+
+# ------------------------------------------------------------------
+# 2.1 Potrivire serii / grupe (A, A-G, Toate, 432E, 3xA, 413Ba ...)
+# ------------------------------------------------------------------
+def seria_se_potriveste(serii_text, grupa_cautata, semigrupa=None):
+    """Verifica daca textul din 'Seriile' (ex: 'A, B, 432E', 'A-G', 'Toate', '441Ab + 444Ab')
+    include grupa utilizatorului. Returneaza SPECIFICITATEA potrivirii:
+      0 = nu se potriveste, 1 = serie intreaga (A / A-G / Toate),
+      2 = grupa anume (432E), 3 = semigrupa anume (432Eb).
+    Fiind numar, se poate folosi si ca True/False. Cand pentru aceeasi disciplina exista
+    atat randuri pe serie cat si pe grupa, cel cu specificitate mai mare castiga."""
+    grupa = str(grupa_cautata).strip().upper()
+    if len(grupa) < 4: return 0
+    cifre, litera = grupa[:3], grupa[3]
+    sg = semigrupa.lower() if semigrupa else None
+
+    text = str(serii_text)
+    text = re.sub(r'\([^)]*\)', ' ', text)                                   # scoate "(TST)", "(15 pers.)"
+    text = re.sub(r'(?i)\b(seria|seriile|serie|grupa|grupele|grupe|series|group)\b', ' ', text)
+    text = re.sub(r'(?i)\b(?:IV|III|II|I)\s*(?=[A-G]\b)', ' ', text)           # "IVC" -> "C"
+    if re.search(r'(?i)\b(toate|toti|toți|all)\b', text): return 1
+
+    best = 0
+    for tok in re.split(r'[,+;/&]|\bsi\b|\band\b', text):
+        tok = tok.strip().replace(' ', '')
+        if not tok: continue
+        m_r = re.fullmatch(r'([A-Ga-g])-([A-Ga-g])', tok)                      # interval de serii
+        if m_r:
+            if m_r.group(1).upper() <= litera <= m_r.group(2).upper(): best = max(best, 1)
+            continue
+        if re.fullmatch(r'[A-G]', tok.upper()) and len(tok) == 1:               # o singura serie
+            if tok.upper() == litera: best = max(best, 1)
+            continue
+        m_g = re.fullmatch(r'([\dxX]{1,3})([A-G])([ab])?', tok)                # 432E, 32E, 3xA, 413Ba
+        if m_g:
+            num, ser, sg_tok = m_g.group(1), m_g.group(2), m_g.group(3)
+            if ser != litera: continue
+            if any(n.lower() != 'x' and n != cifre[-1 - i] for i, n in enumerate(reversed(num))): continue
+            if sg_tok:
+                if sg is None or sg_tok == sg: best = max(best, 3)
+            else:
+                best = max(best, 2)
+    return best
+
+# ------------------------------------------------------------------
+# 2.2 Potrivire de nume (discipline) si abrevieri
+# ------------------------------------------------------------------
+CUVINTE_GOALE = {'de', 'si', 'in', 'a', 'ale', 'al', 'la', 'pentru', 'cu', 'din', 'pe', 'of', 'and', 'the', 'for', 'to', 'ii'}
+TIPURI_ACTIVITATE = {
+    'c': 'curs', 'curs': 'curs', 'course': 'curs', 'lecture': 'curs',
+    'l': 'laborator', 'lab': 'laborator', 'laborator': 'laborator', 'laboratory': 'laborator',
+    's': 'seminar', 'sem': 'seminar', 'seminar': 'seminar',
+    'p': 'proiect', 'proiect': 'proiect', 'project': 'proiect',
+}
+
+def aliase_nume(text):
+    """'Sisteme de operare \\n/ \\nCurs aplicativ...' -> ['Sisteme de operare', 'Curs aplicativ...']"""
+    bucati = []
+    for linie in str(text).split('\n'):
+        for b in re.split(r'\s/\s|^/$|\s/$|^/\s', linie.strip()):
+            b = b.strip(' /-')
+            if b: bucati.append(b)
+    return bucati
+
+def baza_nume(text):
+    t = normalize_key(text)
+    t = re.sub(r'\([^)]*\)', ' ', t)
+    t = re.sub(r'\b(curs|laborator|seminar|proiect|project|lab|sem)\b', ' ', t)
+    t = re.sub(r'[^a-z0-9 ]', ' ', t)
+    return re.sub(r'\s+', ' ', t).strip()
+
+def _tokeni(baza):
+    return [w for w in baza.split() if w not in CUVINTE_GOALE]
+
+def _nume_simplu_potrivit(x, y):
+    bx, by = baza_nume(x), baza_nume(y)
+    if not bx or not by: return False
+    if bx == by or difflib.SequenceMatcher(None, bx, by).ratio() >= 0.85: return True      # tolereaza greseli de scriere (Filosofie/Filozofie)
+    tx, ty = _tokeni(bx), _tokeni(by)
+    if not tx or not ty: return False
+    def prefix(w, v): return (w == v or (len(w) >= 4 and len(v) >= 4 and (w.startswith(v) or v.startswith(w)))
+                              or (len(v) >= 3 and w.endswith(v) and len(w) - len(v) <= 1) or (len(w) >= 3 and v.endswith(w) and len(v) - len(w) <= 1))
+    hit = sum(1 for w in tx if any(prefix(w, v) for v in ty))
+    mic = min(len(tx), len(ty))
+    return hit >= min(2, mic) and hit / mic >= 0.75
+
+def nume_potrivit(a, b):
+    """True daca doua denumiri (eventual cu variante separate prin '/') se refera la aceeasi disciplina."""
+    return any(_nume_simplu_potrivit(x, y) for x in aliase_nume(a) for y in aliase_nume(b))
+
+def acronime(nume):
+    """'Teoria transmisiunii informatiei' -> {'tti'};  'Semnale si sisteme 3' -> {'ss3', 'ss'};
+    'Programarea Calculatoarelor ... (PCLP)' -> {'pclp', ...}"""
+    rezultat = set()
+    for al in aliase_nume(nume):
+        for m in re.findall(r'\(([A-Za-z0-9][A-Za-z0-9\-]{1,9})\)', al):
+            rezultat.add(normalize_key(m))
+        cuvinte = _tokeni(baza_nume(al))
+        if len(cuvinte) < 2: continue
+        initiale = ''.join(w if w.isdigit() else w[0] for w in cuvinte)
+        rezultat.add(initiale)
+        rezultat.add(re.sub(r'\d+$', '', initiale))
+    return {r for r in rezultat if len(r) >= 2}
+
+def abreviere_din_celula(text):
+    """'CIA (l) B13' -> 'cia' ; 'IEM(l)' -> 'iem' ; 'Tech. Web (p)' -> 'tech. web' ; 'Pr. CEF 2' -> ''"""
+    t = scoate_sala_din_text(text)
+    m = re.match(r'^\s*([^()]{1,20}?)\s*\(', t)
+    return normalize_key(m.group(1)) if m else ''
+
+def abreviere_potriveste_nume(abr, nume_norm):
+    """Fallback pentru abrevieri care nu sunt initiale: 'fiz' ~ 'fizica', 'chim' ~ 'chimie', 'amp' ~ 'arhitectura microprocesoarelor'.
+    Conditii: >= 3 litere, prima litera = prima litera a numelui, restul literelor apar in ordine in nume."""
+    cuvinte = _tokeni(baza_nume(nume_norm))
+    if len(abr) < 3 or not cuvinte or abr[0] != cuvinte[0][0]: return False
+    it = iter(''.join(cuvinte))
+    return all(ch in it for ch in abr)
+
+def tip_din_celula(text):
+    m = re.search(r'\(\s*([A-Za-z]+)\s*\)', str(text))
+    return TIPURI_ACTIVITATE.get(m.group(1).lower(), '') if m else ''
+
+def cheie_proiect(text):
+    """'Pr. CEF 2' / 'Proiect CEF' -> 'cef' (altfel '')"""
+    m = re.match(r'^\s*(?:proiect|project|pr\b\.?)\s*([A-Za-z\-]+)', scoate_sala_din_text(text), re.IGNORECASE)
+    return normalize_key(m.group(1)) if m else ''
+
+# ------------------------------------------------------------------
+# 2.3 Zile / ore scrise "salbatic" (Luni 15 -17 impar, Impar Marti 9-11, Joi 13 15 par ...)
+# ------------------------------------------------------------------
+REGEX_ZI = re.compile(r'(?i)\b(luni|mar[tț][iî]|miercuri|joi|vineri)\b')
+REGEX_ORE = re.compile(r'(?<!\d)(\d{1,2})\s*(?:-|–|—|\s)\s*(\d{1,2})(?!\d)')
+
+def nume_zi(text):
+    t = normalize_key(text)
+    return {'luni': 'LUNI', 'marti': 'MARTI', 'miercuri': 'MIERCURI', 'joi': 'JOI', 'vineri': 'VINERI'}.get(t)
+
+def _paritate_din(text):
+    m = re.search(r'(?i)\b(impar|par)[ea]?\b', text)
+    return None if not m else ('Impara' if m.group(1).lower() == 'impar' else 'Para')
+
+def parseaza_sloturi(text_zi_ora, sala_text="", tip_implicit=""):
+    """Transforma textul din 'Ziua si ora' in lista de sloturi:
+    [{'Ziua','OraStart','OraStop','Paritate','Sala','Tip','Nota'}]. Suporta mai multe zile/ore intr-o celula,
+    paritate inainte/dupa ('Impar Marti 9-11', 'Luni par 19-21', 'Miercuri 11-13 (par)') si sali pe linii."""
+    linii = [l.strip() for l in str(text_zi_ora).replace('\xa0', ' ').split('\n') if l.strip()]
+    sali = [s.strip() for s in str(sala_text).replace('\xa0', ' ').split('\n') if s.strip()]
+    sloturi = []
+    for linie in linii:
+        linie_c = re.sub(r'(?i)\([^)]*s[aă]pt[^)]*\)', ' ', linie)
+        linie_c = re.sub(r'(?i)s[aă]pt[a-z\.\s]*\d{1,2}\s*-\s*\d{1,2}', ' ', linie_c)
+        zile = list(REGEX_ZI.finditer(linie_c))
+        if not zile:
+            # linie fara zi: o nota atasata ultimului slot (ex: "impar - 441B, par - 444B")
+            if sloturi: sloturi[-1]['Nota'] = (sloturi[-1]['Nota'] + ' ' + linie).strip()
+            continue
+        for i, mz in enumerate(zile):
+            sfarsit = zile[i + 1].start() if i + 1 < len(zile) else len(linie_c)
+            segment = linie_c[mz.end():sfarsit]
+            ziua = nume_zi(mz.group(1))
+            prefix = linie_c[max(0, mz.start() - 8):mz.start()]
+            m_pref = re.search(r'(?i)\b(impar|par)[ea]?\s*$', prefix)
+            par_pref = _paritate_din(m_pref.group(0)) if m_pref else None
+            tip = tip_din_celula(linie_c) or next((TIPURI_ACTIVITATE[w] for w in re.findall(r'(?i)\b(curs|laborator|seminar|proiect)\b', linie_c.lower())), '') or tip_implicit
+            ranges = list(REGEX_ORE.finditer(segment))
+            for j, mr in enumerate(ranges):
+                h1, h2 = int(mr.group(1)), int(mr.group(2))
+                if not (8 <= h1 < h2 <= 21): continue
+                dupa = segment[mr.end(): ranges[j + 1].start() if j + 1 < len(ranges) else len(segment)]
+                m_dupa = re.match(r'\s*[\(,]?\s*(impar|par)[ea]?\b', dupa, re.IGNORECASE)
+                inainte = segment[: mr.start()]
+                par = (_paritate_din(m_dupa.group(0)) if m_dupa else None) or _paritate_din(inainte) or par_pref or 'Ambele'
+                k = len(sloturi)
+                sala = sali[0] if len(sali) == 1 else (sali[k] if k < len(sali) else (sali[-1] if sali else ''))
+                sloturi.append({'Ziua': ziua, 'OraStart': max(h1, 9), 'OraStop': h2, 'Paritate': par,
+                                'Sala': curata_sala(sala), 'Tip': tip, 'Nota': ''})
+    return sloturi
+
+def curata_sala(text):
+    """'B214 / B215' -> 'B214, B215'; '???', 'nan', 'Consultati orar' -> ''"""
+    t = str(text).replace('\xa0', ' ').strip()
+    if t.lower() in ('nan', '', '-', '--', '???') or 'consult' in t.lower(): return ''
+    t = re.sub(r'\s*\n\s*', ', ', t)
+    t = re.sub(r'\s*/\s*', ', ', t)
+    return re.sub(r'\s+', ' ', t).strip(' ,')
+
+def eticheta_slot(s):
+    zi = s['Ziua'].capitalize()
+    par = {'Impara': ' impar', 'Para': ' par', 'Ambele': ''}[s['Paritate']]
+    sala = f" [{s['Sala']}]" if s['Sala'] else ''
+    return f"{zi} {s['OraStart']}-{s['OraStop']}{par}{sala}"
+
+def aplica_nota_paritate(slot, grupa, semigrupa):
+    """Nota de tip 'impar - 441B, par - 444B' decide paritatea in functie de grupa utilizatorului."""
+    nota = slot.get('Nota', '')
+    gasite = re.findall(r'(?i)\b(impar|par)[ea]?\s*[-–:]\s*([0-9xX]{1,3}[A-G][ab]?)', nota)
+    if not gasite: return slot
+    for par, grp in gasite:
+        if seria_se_potriveste(grp, grupa, semigrupa):
+            slot = dict(slot); slot['Paritate'] = 'Impara' if par.lower() == 'impar' else 'Para'
             break
-            
-    if serii_text in ["TOATE", "TOTI", "TOȚI", "ALL"]: return True
+    return slot
 
-    if '-' in serii_text: # Daca e interval (ex: A-F)
-        capete = serii_text.split('-')
-        if len(capete) == 2:
-            st = capete[0].strip().upper()
-            dr = capete[1].strip().upper()
-            if len(st) == 1 and len(dr) == 1 and len(seria_mea) == 1:
-                if st <= seria_mea <= dr:
-                    return True
-
-    # Desparte lista prin virgula si cauta seria ta
-    serii = [s.strip().upper() for s in serii_text.split(',')]
-    if seria_mea in serii: return True
-    if grupa_cautata in serii: return True
-    if (grupa_cautata + "A") in serii or (grupa_cautata + "B") in serii: return True
-    return False
+# ------------------------------------------------------------------
+# 2.4 Gasirea foilor (nu mai depindem de nume exacte)
+# ------------------------------------------------------------------
+def gaseste_foi(fisier, anul):
+    """Intoarce (foaia_cu_orarul, foaia_cu_anunturi). Cauta dupa model ('AN 3', 'Anunturi - AN3', 'Anunțuri an 3'...)."""
+    nume = pd.ExcelFile(fisier).sheet_names
+    def n(x): return re.sub(r'\s+', '', normalize_key(x))
+    foaie_orar = next((s for s in nume if re.fullmatch(rf'an0?{anul}', n(s))), None)
+    foaie_anunturi = next((s for s in nume if 'anunt' in n(s) and re.search(rf'an0?{anul}(?!\d)', n(s))), None)
+    return foaie_orar or f"AN {anul}", foaie_anunturi or f"Anunturi - AN{anul}"
 
 # ==========================================
 # 3. CITIRE DATE DIN EXCEL (EXTRACT & TRANSFORM)
 # ==========================================
+_CACHE_FOI = {}
+
 def citeste_sheet(fisier, nume_sheet):
-    return pd.read_excel(fisier, sheet_name=nume_sheet, header=None)
+    # Citim fiecare foaie o singura data (e lent), apoi dam mai departe o copie ca sa nu stricam originalul
+    cheie = (fisier, nume_sheet, os.path.getmtime(fisier))
+    if cheie not in _CACHE_FOI:
+        _CACHE_FOI[cheie] = pd.read_excel(fisier, sheet_name=nume_sheet, header=None)
+    return _CACHE_FOI[cheie].copy()
 
 def detecteaza_coloane_grupa(df, grupa_cautata):
-    # Cauta capetele de tabel cu numele grupei/semigrupei (ex: 411Ca si 411Cb)
+    # Cauta capetele de tabel cu numele grupei/semigrupei (ex: 411Ca si 411Cb).
+    # Daca secretariatul a scris accidental aceeasi grupa de doua ori, o folosim pe prima.
     sg_a = (grupa_cautata + "a").lower()
     sg_b = (grupa_cautata + "b").lower()
     col_sga, col_sgb = None, None
 
-    for r in range(min(8, len(df))): # Se uita doar pe primele 8 randuri, in header
+    for r in range(min(12, len(df))):
         for c in df.columns:
-            val = normalize_text(df.iloc[r, c]).lower()
-            if val == sg_a: col_sga = c
-            elif val == sg_b: col_sgb = c
+            val = re.sub(r'\s+', '', normalize_text(df.iloc[r, c]).lower())
+            if val == sg_a and col_sga is None: col_sga = c
+            elif val == sg_b and col_sgb is None: col_sgb = c
 
     return col_sga, col_sgb
 
@@ -371,142 +572,180 @@ def grupa_are_semigrupe(fisier, nume_sheet, grupa):
     col_sga, col_sgb = detecteaza_coloane_grupa(df, grupa)
     return col_sgb is not None
 
-def detecteaza_coloane_anunturi(df):
-    # Scanare Verticala pt pagina de anunturi: citeste header-ul ca sa stie pe ce coloana e Sala, Ora, etc.
-    col_disc, col_serii, col_sala, col_zi_ora = 0, 1, 2, -1
-    for r in range(min(20, len(df))):
-        gasit = False
-        for c in range(len(df.columns)):
-            val = str(df.iloc[r, c]).strip().lower()
-            if val in ["sala", "sala / room"]:
-                col_sala = c
-                gasit = True
-            elif "disciplin" in val or "proiecte" in val:
-                col_disc = c
-            elif "serii" in val or "grup" in val:
-                col_serii = c
-            elif "ziua" in val or ("ora" in val and "laborat" not in val):
-                col_zi_ora = c
-        if gasit: break # S-a oprit cand a gasit header-ul
-        
-    # Daca secretariatul a uitat sa puna titlu pentru Ziua/Ora, deducem ca e in stanga coloanei de Sală
-    if col_zi_ora == -1:
-        col_zi_ora = col_sala - 1 if col_sala > 0 else 2
-    return col_disc, col_serii, col_sala, col_zi_ora
+# ------------------------------------------------------------------
+# 3.1 Foaia de ANUNTURI: parser generic de tabele
+# ------------------------------------------------------------------
+# Secretariatul isi schimba formatul de la un semestru la altul (coloane in alta ordine, tabele noi, alte titluri).
+# De aceea NU mai citim coloanele "pe pozitie", ci recunoastem fiecare tabel dupa randul lui de antet
+# (Disciplina / Seriile / Ziua si ora / Sala ...) si transformam fiecare rand intr-o "inregistrare" uniforma.
 
-def extrage_sali_laborator(fisier_curatat, nume_sheet_anunturi, grupa_cautata, traducator_activ):
-    dataframe = citeste_sheet(fisier_curatat, nume_sheet_anunturi)
-    col_disc, col_serii, col_sala, _ = detecteaza_coloane_anunturi(dataframe)
-    
-    # Trage numele disciplinelor in jos peste celulele lasate goale din lene de secretariat
-    dataframe[col_disc] = dataframe[col_disc].ffill()
-    dictionar_sali = {}
+REGEX_SALA_EXACTA = re.compile(r'^[A-Za-z]{1,3}\s?\d{2,4}[A-Za-z]?$')
+REGEX_SALA_IN_TEXT = re.compile(r'\b([A-Za-z]{1,3}\s?\d{2,4}[A-Za-z]?)\b')
+REGEX_ANUNT_PROIECT = re.compile(
+    r'(?i)seria(?:ile)?\s+([A-G](?:\s*[,+]\s*[A-G])*)\s+(\d{1,2})\s*-\s*(\d{1,2})\s+(luni|marti|miercuri|joi|vineri)\s*[,;]?\s*([A-Za-z]{1,3}\s?\d{2,4}[A-Za-z]?)')
 
-    for rand in range(len(dataframe)):
-        row_vals = [str(x).strip().lower() for x in dataframe.iloc[rand]]
-        # Daca vede un alt cap de tabel inserat in mijloc, isi reseteaza coloanele
-        if any("disciplin" in x for x in row_vals):
-            for c, val in enumerate(row_vals):
-                if "disciplin" in val or "proiecte" in val: col_disc = c
-                elif "serii" in val or "grup" in val: col_serii = c
-                elif val in ["sala", "sala / room"]: col_sala = c
+def _rol_antet(celula):
+    s = normalize_key(celula)
+    if not s or len(s) > 45 or 'formular' in s or 'repartizare' in s: return None
+    if 'disciplin' in s or 'subject' in s: return 'disc'
+    if 'activitate' in s or s in ('tip', 'activity'): return 'activ'
+    if re.search(r'\b(seria|serii|seriile|series|grupa|grupe|grupele)\b', s): return 'serii'
+    if s.startswith('ziua') or s in ('ora', 'interval') or s.startswith('interval') or 'day and time' in s or s.startswith('ora '): return 'zi_ora'
+    if s.startswith('sala') or s.startswith('sali') or 'room' in s: return 'sala'
+    if s in ('c.d.', 'cd') or 'cadru' in s or 'profesor' in s: return 'prof'
+    if 'observati' in s: return 'obs'
+    return None
 
-        raw_col0 = str(dataframe.iloc[rand, col_disc]).strip()
-        # Filtreaza gunoaiele si titlurile intermediare
-        if raw_col0.lower() in ['nan', '', 'disciplina'] or raw_col0.lower().startswith('sali') or raw_col0.lower().startswith('proiecte'):
+def _titlu_bloc(text):
+    """'Compatibilitate electromagnetica\\n CEM\\n (laborator)\\nLab incepe...' -> (nume_cu_variante, tip)"""
+    linii = [l.strip() for l in str(text).split('\n') if l.strip()]
+    nume, tip = [], ''
+    for l in linii:
+        m = re.fullmatch(r'\(\s*([A-Za-z]+)\s*\)', l)
+        if m and m.group(1).lower() in TIPURI_ACTIVITATE:
+            tip = TIPURI_ACTIVITATE[m.group(1).lower()]
+            break
+        nume.append(l)
+        if len(nume) >= 3: break
+    if not tip: nume = nume[:1]
+    return '\n'.join(nume), tip
+
+def parseaza_anunturi(df):
+    """Transforma foaia de anunturi intr-o lista de inregistrari:
+       {'sect': obligatorii|optionale|facultative|alte|proiect_text, 'disc', 'activ', 'serii', 'zi_ora', 'sala', 'bloc_tip', 'in_bloc'}"""
+    inreg = []
+    sect, antet = 'obligatorii', {}
+    bloc_nume, bloc_tip = '', ''
+    ult_disc = ult_serii = ult_sala = ''
+    topic_proiect, rand_topic = '', -99
+
+    for r in range(len(df)):
+        celule = ['' if pd.isna(v) else str(v).replace('\xa0', ' ').strip() for v in df.iloc[r]]
+        neg = [(c, t) for c, t in enumerate(celule) if t and t.lower() != 'nan']
+        if not neg: continue
+        col0 = celule[0]
+        col0_n = normalize_key(col0)
+
+        # --- Anunturi in text liber despre proiecte: "Proiect CEF" + "Seria E 9-13 miercuri, B100"
+        if len(neg) == 1 and neg[0][0] == 0:
+            if re.match(r'^(?:proiect|project)\s+\S', col0_n) and '\n' not in col0:
+                topic_proiect, rand_topic = cheie_proiect(col0), r
+            for linie in col0.split('\n'):
+                m = REGEX_ANUNT_PROIECT.search(normalize_key(linie).replace('marti', 'marti'))
+                if m and topic_proiect and r - rand_topic <= 6:
+                    inreg.append({'sect': 'proiect_text', 'disc': 'proiect ' + topic_proiect, 'topic': topic_proiect,
+                                  'serii': m.group(1), 'zi_ora': f"{m.group(4)} {m.group(2)}-{m.group(3)}",
+                                  'sala': m.group(5).upper().replace(' ', ''),
+                                  'activ': 'proiect', 'bloc_tip': 'proiect', 'in_bloc': False})
+            # titlu de sectiune?
+            if len(col0) <= 60 and re.match(r'^(discipline|sali|laboratoare|alte)\b', col0_n):
+                sect = _sectiune(col0_n, sect)
             continue
-        if "optionale" in raw_col0.lower(): break # Opreste aici, optionalele le facem in alta functie
 
-        disciplina_bruta = normalize_key(raw_col0)
-        seriile = normalize_text(dataframe.iloc[rand, col_serii]) if col_serii < len(dataframe.columns) else ""
-        sala = normalize_text(dataframe.iloc[rand, col_sala]) if col_sala < len(dataframe.columns) else ""
+        # --- Rand de antet?
+        roluri = {c: _rol_antet(t) for c, t in neg}
+        roluri_dr = {c: ro for c, ro in roluri.items() if ro and c > 0}
+        constante_sala = {c: t for c, t in neg if c > 0 and not roluri.get(c) and REGEX_SALA_EXACTA.match(t)}
+        distincte = set(roluri_dr.values()) - {'obs', 'prof'}
+        esteantet = len(distincte | ({'sala'} if constante_sala else set())) >= 2 or (roluri.get(0) == 'disc' and len(distincte) >= 1)
+        if esteantet:
+            antet = {}
+            for c, ro in roluri_dr.items(): antet.setdefault(ro, c)
+            if roluri.get(0) == 'disc': antet['disc'] = 0
+            antet.setdefault('disc', 0)
+            antet['sala_const'] = next(iter(constante_sala.values()), '')
+            if col0 and (len(col0) > 60 or '\n' in col0):
+                bloc_nume, bloc_tip = _titlu_bloc(col0)
+                ult_disc = bloc_nume
+            else:
+                bloc_nume, bloc_tip = '', ''
+                ult_disc = ''
+            if col0 and len(col0) <= 90 and re.match(r'^(discipline|sali|laboratoare|alte)\b', col0_n):
+                sect = _sectiune(col0_n, sect)
+            ult_serii = ult_sala = ''
+            continue
 
-        if sala.lower() in ['nan', '', '-', '--']: continue
-        if not seria_se_potriveste(seriile, grupa_cautata): continue # Ignora materiile de la alte serii
+        # --- Rand de date
+        if not antet: continue
+        def luat(rol):
+            c = antet.get(rol)
+            return celule[c] if c is not None and c < len(celule) else ''
+        disc_cell = luat('disc') if antet.get('disc', 0) != 0 or col0 else ''
+        if disc_cell.startswith(('-', '*')) or normalize_key(disc_cell).startswith('disciplina poarta'): continue
+        serii, zi_ora, sala, activ = luat('serii'), luat('zi_ora'), luat('sala'), luat('activ')
+        if not sala: sala = antet.get('sala_const', '') if (antet.get('sala_const') and sect == 'alte') else ''
+        if disc_cell:
+            ult_disc, ult_serii, ult_sala = disc_cell, '', ''
+        if not serii: serii = ult_serii
+        else: ult_serii = serii
+        if not sala and ult_sala and not disc_cell: sala = ult_sala      # celula de sala unita pe mai multe randuri
+        elif sala: ult_sala = sala
+        if not (zi_ora or sala) or not ult_disc: continue
+        inreg.append({'sect': sect, 'disc': ult_disc, 'activ': normalize_key(activ), 'serii': serii,
+                      'zi_ora': zi_ora, 'sala': sala, 'bloc_tip': bloc_tip, 'in_bloc': bool(bloc_nume), 'r': r})
+    return inreg
 
-        dictionar_sali[disciplina_bruta] = sala
+def _sectiune(t, curenta):
+    if 'optional' in t: return 'optionale'
+    if 'facultativ' in t: return 'facultative'
+    if t.startswith('alte'): return 'alte'
+    if 'sali' in t or 'obligator' in t: return 'obligatorii'
+    return curenta
 
-        # Traducem numele lung din Anunturi in cel scurt din Orar
-        for prescurtare, nume_lung in traducator_activ.items():
-            p_norm = normalize_key(prescurtare)
-            n_norm = normalize_key(nume_lung)
+def extrage_sali_laborator(fisier_curatat, nume_sheet_anunturi, grupa_cautata, traducator_activ, semigrupa=None):
+    """Construieste dictionarul {nume/abreviere normalizata -> sala} pentru disciplinele OBLIGATORII ale grupei.
+    Se salveaza fiecare disciplina sub mai multe chei: numele lung, abrevierea din orar (din traducator)
+    si acronimul generat automat ('Teoria transmisiunii informatiei' -> 'tti')."""
+    dataframe = citeste_sheet(fisier_curatat, nume_sheet_anunturi)
+    dictionar_sali, specificitate = {}, {}
 
-            # Evitam potriviri periculoase pe randuri mixte de tip "Fizica / Sport"
-            if '/' in disciplina_bruta:
-                continue
-            # Salvam si numele scurt si numele lung
-            if n_norm in disciplina_bruta or p_norm in disciplina_bruta:
-                dictionar_sali[p_norm] = sala
-                dictionar_sali[n_norm] = sala
+    def pune(cheie, sala, spec):
+        # un rand pe grupa anume bate un rand pe intreaga serie; la egalitate, ultimul rand castiga
+        if cheie and specificitate.get(cheie, 0) <= spec:
+            dictionar_sali[cheie] = sala
+            specificitate[cheie] = spec
 
+    for rec in parseaza_anunturi(dataframe):
+        sala = curata_sala(rec['sala'])
+        if not sala: continue
+        if rec['sect'] == 'proiect_text':
+            spec = seria_se_potriveste(rec['serii'], grupa_cautata, semigrupa)
+            if spec: pune('proiect:' + rec['topic'], sala, spec)
+            continue
+        optional_cu_sala = (rec['sect'] == 'optionale' and (re.search(r'(?i)laborator|proiect|\blab\b', rec['disc'])
+                                                            or not parseaza_sloturi(rec['zi_ora'])))
+        if rec['sect'] != 'obligatorii' and not optional_cu_sala: continue
+        spec = seria_se_potriveste(rec['serii'], grupa_cautata, semigrupa)
+        if not spec: continue
+        if rec['sect'] != 'obligatorii':
+            # optionalele: doar numele (nu acronimele generate), ca sa nu se amestece cu disciplinele obligatorii
+            for alias in aliase_nume(rec['disc']):
+                pune(normalize_key(re.sub(r'\s+', ' ', alias)), sala, spec)
+                pune(baza_nume(alias), sala, spec)
+                for abr_p in re.findall(r'\(([^)]{2,15})\)', alias):          # abrevierea scrisa in paranteza: "(SEP)", "(Tech. Web)"
+                    if normalize_key(abr_p) not in TIPURI_ACTIVITATE: pune(normalize_key(abr_p), sala, spec)
+            continue
+
+        este_lab = rec['activ'] in ('', 'laborator', 'proiect') or 'lab' in rec['activ']
+        for alias in aliase_nume(rec['disc']):
+            disciplina_bruta = normalize_key(re.sub(r'\s+', ' ', alias))
+            pune(disciplina_bruta, sala, spec)
+            if este_lab:
+                for ac in acronime(alias): pune(ac, sala, spec)
+            if len(aliase_nume(rec['disc'])) > 1: continue   # evitam potriviri periculoase pe randuri mixte "X / Y"
+            # Traducem numele lung din Anunturi in cel scurt din Orar
+            for prescurtare, nume_lung in traducator_activ.items():
+                p_norm, n_norm = normalize_key(prescurtare), normalize_key(nume_lung)
+                if n_norm in disciplina_bruta or p_norm in disciplina_bruta:
+                    # potrivirea exacta bate potrivirea prin "contine" (ca "Fizica" sa nu primeasca sala de la "Educatie fizica si sport")
+                    spec_t = spec if disciplina_bruta in (n_norm, p_norm) else spec - 0.5
+                    pune(p_norm, sala, spec_t)
+                    pune(n_norm, sala, spec_t)
     return dictionar_sali
 
-def extrage_optiuni_disponibile(fisier_curatat, nume_sheet_anunturi, grupa_cautata):
-    # Citeste optiunile din Excel si construieste un meniu numerotat de tip [1, 2, 3...]
-    dataframe = citeste_sheet(fisier_curatat, nume_sheet_anunturi)
-    col_disc, col_serii, col_sala, col_zi_ora = detecteaza_coloane_anunturi(dataframe)
-    dataframe[col_disc] = dataframe[col_disc].ffill()
-    
-    optiuni = {}
-    tip_curent = None
-
-    for rand in range(len(dataframe)):
-        row_vals = [str(x).strip().lower() for x in dataframe.iloc[rand]]
-        if any("disciplin" in x for x in row_vals):
-            for c, val in enumerate(row_vals):
-                if "disciplin" in val: col_disc = c
-                elif "serii" in val or "grup" in val: col_serii = c
-                elif "ziua" in val or ("ora" in val and "laborat" not in val): col_zi_ora = c
-                elif val in ["sala", "sala / room"]: col_sala = c
-
-        col0 = normalize_text(dataframe.iloc[rand, col_disc])
-        col0_lower = col0.lower()
-
-        # Cand intram in Opționale / Facultative, activeaza tipul curent
-        if "optional" in col0_lower or "opțional" in col0_lower:
-            tip_curent = "Optional"
-            continue
-        elif "facultativ" in col0_lower or "liber" in col0_lower:
-            tip_curent = "Facultativ"
-            continue
-
-        if tip_curent is None or col0 in ['nan', 'Disciplina']: continue
-
-        # Uneste variantele Ro/En cu un slash (ex: "Sociologie / Sociology")
-        linii_disc = [x.strip() for x in col0.split('\n') if x.strip()]
-        disciplina = " / ".join(linii_disc) if len(linii_disc) > 1 else col0.strip()
-
-        seriile = normalize_text(dataframe.iloc[rand, col_serii]) if col_serii < len(dataframe.columns) else ""
-        raw_ziua = str(dataframe.iloc[rand, col_zi_ora]).strip().replace(',', ' / ') if col_zi_ora < len(dataframe.columns) else ""
-        raw_sala = str(dataframe.iloc[rand, col_sala]).strip().replace('\n', ' / ') if col_sala < len(dataframe.columns) else ""
-
-        if raw_ziua == 'nan' or raw_sala == 'nan' or not raw_ziua: continue
-
-        # Curatam modul in care sunt scrise orele, pastrand asocierile corecte cu ziua
-        zile_saptamana = ['LUNI', 'MARTI', 'MIERCURI', 'JOI', 'VINERI']
-        linii_zo = [x.strip() for x in raw_ziua.split('\n') if x.strip()]
-        curat_zo = []
-        for linie in linii_zo:
-            are_zi = any(z in linie.upper() for z in zile_saptamana)
-            if are_zi or not curat_zo:
-                curat_zo.append(linie)
-            else:
-                curat_zo[-1] += f" / {linie}"
-
-        ziua_ora = " / ".join(curat_zo)
-        ziua_ora = re.sub(r'\s*/\s*/\s*', ' / ', ziua_ora)
-
-        # Adauga in meniu (Dictionar) doar materiile valabile pentru grupa ta, si le asigneaza un ID crescator (1, 2...)
-        if seria_se_potriveste(seriile, grupa_cautata):
-            optiuni[len(optiuni) + 1] = {
-                "Nume": disciplina,
-                "Zi_Ora": ziua_ora,
-                "Sala": raw_sala,
-                "Tip": tip_curent
-            }
-
-    return optiuni
-
+# ------------------------------------------------------------------
+# 3.2 Foaia de ORAR: coloane + grila
+# ------------------------------------------------------------------
 def detecteaza_coloana_ora(df, col_sga):
     # Pleaca de la coloana cu grupa ta si merge cu -1 spre stanga pentru a gasi Timpul
     if col_sga is None: return 1
@@ -522,17 +761,17 @@ def detecteaza_coloana_sala(df, col_sga, grupa_cautata):
     # Pleaca de la coloana ta si se uita cu +1 spre dreapta dupa Sală
     if col_sga is None: return None
     seria_mea = grupa_cautata[-1].lower()
-    
+
     for c in range(col_sga + 1, len(df.columns)):
         alta_serie = False
         for r in range(min(8, len(df))):
             val = normalize_text(df.iloc[r, c]).lower()
             if val in ["sala", "sala / room", "săli"]: return c # Cauta normal dupa titlu
-            
+
             # Daca da de grupa altei serii (ex: noi suntem F si vedem 431Ga), opreste scanarea spre dreapta
             if len(val) >= 4 and val[:2].isdigit() and val[3].isalpha():
                 if val[3] != seria_mea: alta_serie = True
-                
+
         if not alta_serie: # Cazul cand secretariatul uita sa scrie titlul Sala
             room_count = 0
             for r in range(8, min(40, len(df))):
@@ -541,7 +780,7 @@ def detecteaza_coloana_sala(df, col_sga, grupa_cautata):
                 if re.match(r'^[A-Z]{1,3}\s*\d{2,4}[A-Z]?$', cell_val.strip(), re.IGNORECASE):
                     room_count += 1
             if room_count >= 2: return c # Daca gaseste minim 2, nu este o coincidenta
-            
+
         if alta_serie: break # Oprim cautarea stricta
 
     # Doar daca 2 serii impart sala, trece de granita seriei si ia prima coloana Sală disponibila.
@@ -549,7 +788,7 @@ def detecteaza_coloana_sala(df, col_sga, grupa_cautata):
         for r in range(min(8, len(df))):
             val = normalize_text(df.iloc[r, c]).lower()
             if val in ["sala", "sala / room", "săli"]: return c
-            
+
     return None
 
 def construieste_grila_goala(exista_sg2):
@@ -565,9 +804,72 @@ def construieste_grila_goala(exista_sg2):
             })
     return grila
 
+
+def parseaza_alternativa(alt):
+    """'Circuite Integrate Digitale 2 (curs) A103 Prof. Popescu G.' -> nume, tip, sala, profesor"""
+    t = re.sub(r'\s+', ' ', str(alt)).strip(' |-/')
+    t = re.sub(r'(?i)^(?:--\s*/\s*)?O\d+\.?\s*(?:\(\s*[a-z]+\s*\)\s*)?', '', t)     # marcajul "O1 (c)" al optionalelor
+    m = re.match(r'^(?P<nume>.*?)\s*\(\s*(?P<tip>[A-Za-z]+)\s*\)\s*(?P<rest>.*)$', t)
+    if m and m.group('tip').lower() in TIPURI_ACTIVITATE:
+        nume, tip, rest = m.group('nume').strip(' -'), TIPURI_ACTIVITATE[m.group('tip').lower()], m.group('rest')
+    else:
+        nume, tip, rest = t, 'curs', ''
+        m_s = re.match(r'^(.*?)\s*\(\s*([A-Za-z]{1,3}\s?\d{2,4}[A-Za-z]?)\s*\)\s*$', t)      # "Sociologie (A103)"
+        if m_s: nume, rest = m_s.group(1), m_s.group(2)
+    nume = re.sub(r'(?i)^opt\.?\s+', '', nume).strip()
+    sala, prof = '', ''
+    m_b = re.search(r'\[([^\]]+)\]', rest)
+    if m_b:
+        sala = m_b.group(1).strip()
+        rest = rest.replace(m_b.group(0), ' ')
+    else:
+        m_s = REGEX_SALA_IN_TEXT.search(rest)
+        if m_s and not re.match(r'(?i)prof', rest[m_s.start():]):
+            sala = m_s.group(1).replace(' ', '')
+            rest = rest.replace(m_s.group(0), ' ', 1)
+    prof = re.sub(r'\s+', ' ', rest).strip(' ,;-')
+    return {'Nume': nume, 'Tip': tip, 'Sala': sala, 'Prof': prof}
+
+def agrega_pools(celule_pool):
+    """Aduna orele consecutive ale aceleiasi alternative intr-un singur interval (11-12 + 12-13 -> 11-13)."""
+    ore = {}
+    for pc in celule_pool:
+        for alt in pc['alts']:
+            info = parseaza_alternativa(alt)
+            ore.setdefault((pc['zi'], baza_nume(info['Nume']), info['Tip'], pc.get('par', 'Ambele')), (info, set()))[1].add(pc['ora'])
+    optiuni = []
+    for (zi, _, _, par), (info, ore_set) in ore.items():
+        lista = sorted(ore_set)
+        start = prev = lista[0]
+        for h in lista[1:] + [None]:
+            if h is not None and h == prev + 1:
+                prev = h
+                continue
+            optiuni.append({**info, 'Ziua': zi, 'OraStart': start, 'OraStop': prev + 1, 'Paritate': par})
+            if h is not None: start = prev = h
+    return optiuni
+
+def separa_alternative(text):
+    """O celula cu mai multe materii separate prin "|" sau "||" contine ALTERNATIVE OPTIONALE (alegi una).
+    Forme intalnite: "A (curs) | B (curs)",  "-- / A | B" (doar saptamani pare),  "A | B / --" (doar impare).
+    Intoarce (lista_alternative, paritate); lista goala daca celula nu e de acest tip."""
+    if '|' not in text: return [], 'Ambele'
+    t, par = text, 'Ambele'
+    m = re.match(r'^\s*(?:--|-)\s*/\s*(.+)$', t, re.S)
+    if m: t, par = m.group(1), 'Para'
+    else:
+        m = re.match(r'^(.+?)\s*/\s*(?:--|-)\s*$', t, re.S)
+        if m: t, par = m.group(1), 'Impara'
+    alts = [a for a in re.split(r'\|+', t) if re.sub(r'[\s\-/]', '', a)]
+    return (alts, par) if len(alts) >= 2 or '||' in text else ([], 'Ambele')
+
 def incarca_date_in_grila(df, grila, col_ora, col_sga, col_sgb, col_sala):
-    # Toarna informatia gasita pe coloanele Excelului in grila goala
+    # Toarna informatia gasita pe coloanele Excelului in grila goala.
+    # Daca o celula contine mai multe materii separate prin "||", ele sunt ALTERNATIVE OPTIONALE:
+    # nu le punem in orarul obligatoriu, ci le intoarcem separat, ca sa le propunem in meniu.
     index_grila = {(e['Ziua'], e['Ora']): e for e in grila}
+    celule_pool = []
+    liber = {"Impara": "Liber", "Para": "Liber"}
 
     for rand in range(2, len(df)):
         ziua = normalize_text(df.iloc[rand, 0]).upper()
@@ -576,9 +878,18 @@ def incarca_date_in_grila(df, grila, col_ora, col_sga, col_sgb, col_sala):
         ore_gasite = extrage_ore_slots(df.iloc[rand, col_ora])
         if not ore_gasite: continue
 
-        # Transforma textul cu materii imparte/pare in dictionar structurat
-        mat_a = parseaza_text_materie(normalize_text(df.iloc[rand, col_sga])) if col_sga is not None else {"Impara": "Liber", "Para": "Liber"}
-        mat_b = parseaza_text_materie(normalize_text(df.iloc[rand, col_sgb])) if col_sgb is not None else {"Impara": "-", "Para": "-"}
+        def citeste_celula(col, implicit):
+            if col is None: return implicit
+            text = normalize_text(df.iloc[rand, col])
+            alts, par = separa_alternative(text)
+            if alts:
+                for h in ore_gasite:
+                    celule_pool.append({'zi': ziua, 'ora': int(h.split('-')[0]), 'alts': alts, 'par': par})
+                return liber
+            return parseaza_text_materie(text)
+
+        mat_a = citeste_celula(col_sga, liber)
+        mat_b = citeste_celula(col_sgb, {"Impara": "-", "Para": "-"})
 
         sala_excel = ""
         if col_sala is not None:
@@ -600,6 +911,8 @@ def incarca_date_in_grila(df, grila, col_ora, col_sga, col_sgb, col_sala):
 
             if sala_excel: slot['SalaExcel'] = sala_excel
 
+    return agrega_pools(celule_pool)
+
 def ataseaza_sala_din_dictionar(text_materie, dictionar_sali, traducator_activ, allow_broad=True):
     # Compara o materie cu dictionarul de sali si, daca gaseste potrivire, lipeste sala cu paranteze "[A05]"
     if text_materie == "Liber": return text_materie
@@ -611,6 +924,16 @@ def ataseaza_sala_din_dictionar(text_materie, dictionar_sali, traducator_activ, 
 
     # allow_broad=True permite potriviri partile (utile pentru laboratoare). La curs, o oprim.
     if allow_broad:
+        # Proiecte anuntate in text liber ("Proiect CEF: Seria E, miercuri, B100") -> "Pr. CEF 2"
+        cheie_pr = cheie_proiect(text_materie)
+        if cheie_pr and ('proiect:' + cheie_pr) in dictionar_sali:
+            return f"{text_materie} [{dictionar_sali['proiect:' + cheie_pr]}]"
+
+        # Abrevierea din orar = acronimul numelui lung din Anunturi ("TTI (l)" = Teoria transmisiunii informatiei)
+        abr = abreviere_din_celula(text_materie)
+        if abr and tip_din_celula(text_materie) in ('laborator', 'proiect') and abr in dictionar_sali:
+            return f"{text_materie} [{dictionar_sali[abr]}]"
+
         for prescurtare, nume_lung in traducator_activ.items():
             p_norm = normalize_key(prescurtare)
             n_norm = normalize_key(nume_lung)
@@ -618,6 +941,16 @@ def ataseaza_sala_din_dictionar(text_materie, dictionar_sali, traducator_activ, 
             if p_norm in text_norm or text_norm == n_norm:
                 if p_norm in dictionar_sali: return f"{text_materie} [{dictionar_sali[p_norm]}]"
                 if n_norm in dictionar_sali: return f"{text_materie} [{dictionar_sali[n_norm]}]"
+
+        # Ultima solutie: abrevierea seamana cu un singur nume lung din dictionar (Fiz -> Fizica)
+        if abr and tip_din_celula(text_materie) in ('laborator', 'proiect'):
+            candidati = {dictionar_sali[k] for k in dictionar_sali
+                         if len(k) >= 5 and ' (l)' not in k and not k.startswith('proiect:') and abreviere_potriveste_nume(abr, k)}
+            if len(candidati) == 1: return f"{text_materie} [{candidati.pop()}]"
+            # greseli de scriere in orar (ex: "Phyton" in loc de "Python")
+            if len(abr) >= 5:
+                apropiat = difflib.get_close_matches(abr, [k for k in dictionar_sali if not k.startswith('proiect:')], n=1, cutoff=0.8)
+                if apropiat: return f"{text_materie} [{dictionar_sali[apropiat[0]]}]"
 
     return text_materie
 
@@ -663,6 +996,7 @@ def ataseaza_salile_finale(grila, dictionar_sali, traducator_activ):
                     if not este_activitate_sport(mat) and sala_de_sport(sala_excel): continue
                     e[sg][par] = f"{mat} [{sala_excel}]"
 
+
 def normalizeaza_sali_cursuri_pe_zi(grila):
     # Daca sala e scrisa doar la semigrupa A (sau la alta grupa), el ia "Sala Dominanta" de pe rand si i-o da si semigrupei B.
     for zi in ZILE_SAPTAMANA:
@@ -688,23 +1022,25 @@ def normalizeaza_sali_cursuri_pe_zi(grila):
                     if not sala or sala_de_sport(sala):
                         e[sg][par] = inlocuieste_sala_in_text(mat, sala_dominanta)
 
+
 def genereaza_orar_grupa(fisier_curatat, nume_sheet, grupa_cautata, dictionar_sali, traducator_activ):
-    # Centralizeaza tot fluxul de creare a orarului pentru grupa curenta
+    # Centralizeaza tot fluxul de creare a orarului pentru grupa curenta.
+    # Intoarce (grila_obligatorie, optionale_gasite_in_orar)
     df = citeste_sheet(fisier_curatat, nume_sheet)
     df[0] = df[0].ffill()
 
     col_sga, col_sgb = detecteaza_coloane_grupa(df, grupa_cautata)
-    if col_sga is None and col_sgb is None: return []
+    if col_sga is None and col_sgb is None: return [], []
 
-    col_ora = detecteaza_coloana_ora(df, col_sga)
-    col_sala = detecteaza_coloana_sala(df, col_sga, grupa_cautata)
+    col_ora = detecteaza_coloana_ora(df, col_sga if col_sga is not None else col_sgb)
+    col_sala = detecteaza_coloana_sala(df, col_sga if col_sga is not None else col_sgb, grupa_cautata)
 
     grila = construieste_grila_goala(exista_sg2=(col_sgb is not None))
-    incarca_date_in_grila(df, grila, col_ora, col_sga, col_sgb, col_sala)
+    pools = incarca_date_in_grila(df, grila, col_ora, col_sga, col_sgb, col_sala)
     ataseaza_salile_finale(grila, dictionar_sali, traducator_activ)
     normalizeaza_sali_cursuri_pe_zi(grila)
 
-    return grila
+    return grila, pools
 
 # ==========================================
 # 4. EXPORT EXCEL (LOAD)
@@ -932,97 +1268,201 @@ def exporteaza_in_excel(orar_baza, optionale_alese, grupa, semigrupa_utilizator)
     print(f"\nOrarul a fost generat si salvat ca '{nume_fisier_iesire}'!")
 
 # ==========================================
-# 5. MENIU OPTIONALE
+# 5. MENIU OPTIONALE / FACULTATIVE
 # ==========================================
-def parseaza_timp_optional(timp_ales):
-    # Traduce textul salbatic "vineri impar 17- 19" in date procesabile: {'Ziua': 'VINERI', 'OraStart': 17, 'OraStop': 19, 'Paritate': 'Impara'}
-    timp_upper = timp_ales.upper()
-    zile_saptamana = ['LUNI', 'MARTI', 'MIERCURI', 'JOI', 'VINERI']
+# Sursele de informatie, in ordinea increderii:
+#   1) grila de orar a grupei (alternativele separate prin "||") -> zi, ora, sala, profesor ale CURSULUI
+#   2) foaia de Anunturi (tabelele de optionale / facultative / "alte anunturi") -> laboratoare, proiecte,
+#      sali, plus facultativele care nu apar in grila.
+# Aceeasi disciplina gasita in ambele locuri este unita intr-o singura optiune (potrivire pe nume).
 
-    ziua_aleasa = next((z for z in zile_saptamana if z in timp_upper), None)
-    if not ziua_aleasa: return None
+NUME_TIP = {'curs': 'curs', 'laborator': 'laborator', 'seminar': 'seminar', 'proiect': 'proiect', 'activitate': 'activitate', '': 'activitate'}
 
-    timp_lower = timp_ales.lower()
-    paritate = "Ambele"
-    if "impar" in timp_lower: paritate = "Impara"
-    elif "par" in timp_lower: paritate = "Para"
+def curata_nume_optiune(nume):
+    # "Elemente de drept (curs)" -> "Elemente de drept" (tipul activitatii se adauga separat, o singura data)
+    return re.sub(r'(?i)\s*\(\s*(curs|laborator|seminar|proiect|lecture|lab)\s*\)\s*$', '', str(nume)).strip()
 
-    match = re.search(r'(\d{1,2})\s*-\s*(\d{1,2})', timp_ales)
-    if not match: return None
+def _optiune_noua(nume, tip_optiune, din_orar=False):
+    nume = curata_nume_optiune(nume)
+    return {'Nume': nume, 'Tip': tip_optiune, 'DinOrar': din_orar, 'Activitati': {}, 'Note': [], 'Sala': ''}
 
-    return {'Ziua': ziua_aleasa, 'OraStart': int(match.group(1)), 'OraStop': int(match.group(2)), 'Paritate': paritate}
+def _adauga_activitate(opt, tip, slot, spec=0, toate=False):
+    tip = tip or 'activitate'
+    act = opt['Activitati'].setdefault(tip, {'Tip': tip, 'Variante': [], 'Toate': toate})
+    act['Variante'].append({**slot, 'Spec': spec})
+
+def _slot_din_pool(p):
+    return {'Ziua': p['Ziua'], 'OraStart': p['OraStart'], 'OraStop': p['OraStop'], 'Paritate': p['Paritate'],
+            'Sala': p['Sala'], 'Prof': p['Prof'], 'Tip': p['Tip'], 'Nota': ''}
+
+def construieste_meniu(fisier_curatat, nume_sheet_anunturi, pools, grupa, semigrupa):
+    """Intoarce (lista_optiuni, lista_fara_ora). Fiecare optiune are 'Activitati' (curs / laborator / proiect ...),
+    iar fiecare activitate are una sau mai multe 'Variante' (sloturi) dintre care utilizatorul alege."""
+    recs = parseaza_anunturi(citeste_sheet(fisier_curatat, nume_sheet_anunturi))
+    optiuni, fara_ora = [], []
+
+    # 1) Optionalele din grila (cursul are ora exacta)
+    for p in pools:
+        opt = next((o for o in optiuni if o['DinOrar'] and nume_potrivit(o['Nume'], p['Nume'])), None)
+        if opt is None:
+            opt = _optiune_noua(p['Nume'], 'Optional', din_orar=True)
+            optiuni.append(opt)
+        _adauga_activitate(opt, p['Tip'], _slot_din_pool(p), spec=99, toate=True)
+
+    # 2) Anunturi: optionale / facultative / blocuri "alte anunturi"
+    for rec in recs:
+        if rec['sect'] not in ('optionale', 'facultative', 'alte'): continue
+        if rec['sect'] == 'alte' and not rec['in_bloc']: continue
+        spec = seria_se_potriveste(rec['serii'], grupa, semigrupa) if rec['serii'] else 1
+        if not spec: continue
+
+        tip_impl = rec['bloc_tip'] or TIPURI_ACTIVITATE.get(rec['activ'], '') or tip_din_celula(rec['disc'])
+        if not tip_impl and rec['sect'] == 'alte': tip_impl = 'laborator'   # blocurile din "Alte anunturi" sunt laboratoare/proiecte
+        sloturi = parseaza_sloturi(rec['zi_ora'], rec['sala'], tip_impl)
+        sala_rec = curata_sala(rec['sala'])
+        if not sloturi and 'orar' in normalize_key(rec['zi_ora']): continue   # "conform orarului": e deja in grila, doar sala conteaza
+
+        opt = next((o for o in optiuni if nume_potrivit(o['Nume'], rec['disc'])), None)
+        if opt is None and rec['sect'] == 'alte': continue          # bloc despre o disciplina pe care n-o ai
+        if opt is None:
+            nume = ' / '.join(aliase_nume(rec['disc'])[:2]) or rec['disc']
+            nume = re.sub(r'\s+', ' ', nume).strip()
+            nume = re.sub(r'(?i)\s*\((?:curs|laborator|seminar|proiect)\)\s*$', '', nume)
+            cheie = ('F' if rec['sect'] == 'facultative' else 'O', normalize_key(rec['disc']))
+            opt = next((o for o in optiuni if o.get('Cheie') == cheie), None)
+            if opt is None:
+                opt = _optiune_noua(nume, 'Facultativ' if rec['sect'] == 'facultative' else 'Optional')
+                opt['Cheie'] = cheie
+                optiuni.append(opt)
+
+        if not sloturi:
+            if sala_rec and not opt['Sala']: opt['Sala'] = sala_rec
+            if rec['sect'] == 'alte' and sala_rec: opt['Note'].append(f"{NUME_TIP.get(tip_impl, 'activitate')} in sala {sala_rec} (fara interval publicat)")
+            continue
+        for s in sloturi:
+            if opt['DinOrar'] and s['Tip'] in ('curs', '') and 'curs' in opt['Activitati']:
+                if s['Tip'] == 'curs' or any((v['Ziua'], v['OraStart'], v['OraStop']) == (s['Ziua'], s['OraStart'], s['OraStop'])
+                                             for v in opt['Activitati']['curs']['Variante']):
+                    continue                                          # cursul il stim deja exact din orar
+            _adauga_activitate(opt, s['Tip'] or tip_impl, s, spec=spec)
+
+    # 3) Completam salile cursului din tabelul "Sala Curs" si filtram variantele dupa grupa
+    for opt in optiuni:
+        for tip, act in list(opt['Activitati'].items()):
+            if act['Toate']:
+                for v in act['Variante']:
+                    if not v['Sala'] and opt['Sala']: v['Sala'] = opt['Sala']
+                continue
+            variante = [aplica_nota_paritate(v, grupa, semigrupa) for v in act['Variante']]
+            max_spec = max(v['Spec'] for v in variante)
+            unice, vazute = [], set()
+            for v in variante:
+                cheie_v = (v['Ziua'], v['OraStart'], v['OraStop'], v['Paritate'], v['Sala'])
+                if v['Spec'] == max_spec and cheie_v not in vazute:
+                    vazute.add(cheie_v); unice.append(v)
+            act['Variante'] = _uneste_ore_consecutive(unice)
+    ramase = []
+    for opt in optiuni:
+        if opt['Activitati']: ramase.append(opt)
+        elif opt['Tip'] == 'Optional': fara_ora.append(opt['Nume'])
+    # Optionalele din Anunturi pentru seria ta care nu apar nicaieri in grila
+    for rec in recs:
+        if rec['sect'] == 'optionale' and not rec['zi_ora'] and (not rec['serii'] or seria_se_potriveste(rec['serii'], grupa, semigrupa)):
+            nume = ' / '.join(aliase_nume(rec['disc'])[:2])
+            if nume and not any(nume_potrivit(nume, o['Nume']) for o in ramase) and nume not in fara_ora:
+                fara_ora.append(nume)
+
+    def cheie_sort(o):
+        s = next(iter(o['Activitati'].values()))['Variante'][0]
+        return (0 if o['Tip'] == 'Optional' else 1, ZILE_SAPTAMANA.index(s['Ziua']) if s['Ziua'] in ZILE_SAPTAMANA else 9, s['OraStart'])
+    ramase.sort(key=cheie_sort)
+    for i, o in enumerate(ramase, 1): o['Id'] = i
+    return ramase, fara_ora
+
+def _uneste_ore_consecutive(variante):
+    """Doua sloturi de cate o ora, cu aceeasi zi/sala/paritate, una dupa alta (Marti 9-10 + Marti 10-11), sunt de fapt
+    o singura sedinta de doua ore."""
+    if len(variante) < 2 or any(v['OraStop'] - v['OraStart'] != 1 for v in variante): return variante
+    rezultat = []
+    for v in sorted(variante, key=lambda x: (x['Ziua'], x['Paritate'], x['Sala'], x['OraStart'])):
+        if rezultat and all(rezultat[-1][k] == v[k] for k in ('Ziua', 'Paritate', 'Sala')) and rezultat[-1]['OraStop'] == v['OraStart']:
+            rezultat[-1] = {**rezultat[-1], 'OraStop': v['OraStop']}
+        else:
+            rezultat.append(dict(v))
+    return rezultat
+
+def afiseaza_meniu(optiuni, tip_optiune):
+    for o in [x for x in optiuni if x['Tip'] == tip_optiune]:
+        print(f" [{o['Id']}] {o['Nume']}")
+        for act in o['Activitati'].values():
+            var = act['Variante']
+            if len(var) == 1 or act['Toate']:
+                print(f"       {NUME_TIP[act['Tip']]}: " + ' + '.join(eticheta_slot(v) for v in var))
+            else:
+                print(f"       {NUME_TIP[act['Tip']]}: {len(var)} variante (alegi dupa selectare)")
+        for nota in o['Note']: print(f"       ({nota})")
+
+def _text_activitate(opt, act, v):
+    prof = f" {v['Prof']}" if v.get('Prof') else ''
+    sala = f" [{v['Sala']}]" if v['Sala'] else ''
+    return f"{opt['Nume']} ({NUME_TIP[act['Tip']]}){prof}{sala}"
 
 def proceseaza_alegeri_meniu(alegeri_str, dict_optiuni, optionale_alese_final):
-    # Parcurge lista de numere introduse in consola (ex: "1,3") si gaseste detaliile materiilor in dictionar
-    numere_alese = alegeri_str.split(',')
-
-    for numar in numere_alese:
+    # Parcurge lista de numere introduse in consola (ex: "1,3") si adauga in orar activitatile fiecarei optiuni
+    for numar in alegeri_str.split(','):
         numar = numar.strip()
         if not (numar.isdigit() and int(numar) in dict_optiuni): continue
-
         opt = dict_optiuni[int(numar)]
-        nume_mat = opt['Nume']
-        
-        raw_ziua = opt['Zi_Ora']
-        raw_sala = opt['Sala']
-        
-        # Curata si izoleaza intervalele (in caz ca o materie are mai multe variante de orar)
-        raw_ziua_clean = re.sub(r'(?i)s[aă]pt[a-z\.\s]*\d{1,2}\s*-\s*\d{1,2}', '', raw_ziua)
-        zile_saptamana = ['LUNI', 'MARTI', 'MIERCURI', 'JOI', 'VINERI']
-        ziua_gasita = next((z for z in zile_saptamana if z in raw_ziua_clean.upper()), "")
+        print(f"\n{opt['Nume']}:")
 
-        matches = re.findall(r'(\d{1,2})\s*-\s*(\d{1,2})', raw_ziua_clean)
-        if not matches: continue
-        
-        variante_timp = [f"{ziua_gasita} {m[0]}-{m[1]}" for m in matches]
-        salile = [s.strip() for s in raw_sala.replace('\n', '/').split('/') if s.strip()]
+        for act in opt['Activitati'].values():
+            variante = act['Variante']
+            if act['Toate'] or len(variante) == 1:
+                alese = variante
+                for v in alese: print(f"  S-a adaugat automat ({NUME_TIP[act['Tip']]}): {eticheta_slot(v)}")
+            else:
+                print(f"  Pentru {NUME_TIP[act['Tip']]} ai {len(variante)} variante:")
+                for i, v in enumerate(variante, 1):
+                    nota = f" - {v['Nota']}" if v.get('Nota') else ''
+                    print(f"    [{i}] {eticheta_slot(v)}{nota}")
+                alegere_v = input(f"  Alege varianta dorita (1-{len(variante)}, Enter = sari peste): ").strip()
+                if not (alegere_v.isdigit() and 1 <= int(alegere_v) <= len(variante)):
+                    print("  Sarim peste.")
+                    continue
+                alese = [variante[int(alegere_v) - 1]]
+            for v in alese:
+                optionale_alese_final.append({
+                    'Nume': _text_activitate(opt, act, v), 'Ziua': v['Ziua'], 'OraStart': v['OraStart'],
+                    'OraStop': v['OraStop'], 'Paritate': v['Paritate'], 'Optiune': opt['Nume']})
+        for nota in opt['Note']: print(f"  Nota: {nota}")
 
-        optiuni_prezentate = []
-        for i, v_timp in enumerate(variante_timp):
-            s_val = salile[i] if i < len(salile) else (salile[-1] if salile else "")
-            optiuni_prezentate.append((v_timp, s_val))
-
-        # Sterge duplicatele posibile din excel
-        optiuni_prezentate = list(dict.fromkeys(optiuni_prezentate))
-
-        # Daca exista doar o varinata de orar pt Optiunea asta, o alege direct
-        if len(optiuni_prezentate) == 1:
-            t_ales, s_aleasa = optiuni_prezentate[0]
-            sala_disp = f" [{s_aleasa}]" if s_aleasa else ""
-            print(f"\nS-a adaugat automat: {nume_mat} -> {t_ales}{sala_disp}")
-            timp_ales, sala_aleasa = t_ales, s_aleasa
-        else:
-            # Daca materia se tine in 2 grupe la ore diferite, primeste alt input
-            print(f"\nPentru '{nume_mat}', ai {len(optiuni_prezentate)} variante:")
-            for i, (t_val, s_val) in enumerate(optiuni_prezentate):
-                s_disp = s_val if s_val else "N/A"
-                print(f"  [{i+1}] {t_val} | Sala: {s_disp}")
-
-            alegere_v = input(f"Alege varianta dorita (1-{len(optiuni_prezentate)}): ").strip()
-            if not (alegere_v.isdigit() and 1 <= int(alegere_v) <= len(optiuni_prezentate)):
-                print("Alegere invalida. Sarim peste.")
-                continue
-
-            idx = int(alegere_v) - 1
-            timp_ales, sala_aleasa = optiuni_prezentate[idx]
-
-        # Formateaza corect item-ul pt dictionar
-        timp_parsat = parseaza_timp_optional(timp_ales)
-        if not timp_parsat:
-            print(f"Nu am putut interpreta ora din '{timp_ales}'")
-            continue
-
-        sala_text_final = f" [{sala_aleasa}]" if sala_aleasa else ""
-        optionale_alese_final.append({
-            'Nume': f"{nume_mat}{sala_text_final}",
-            **timp_parsat
-        })
+def detecteaza_conflicte(orar_baza, optionale_alese, semigrupa_utilizator, are_sg2):
+    # Avertizeaza cand o optiune aleasa se suprapune cu o materie obligatorie sau cu o alta optiune
+    sg = 'SG2' if (semigrupa_utilizator == 'b' and are_sg2) else 'SG1'
+    index = {(e['Ziua'], int(e['Ora'].split('-')[0])): e for e in orar_baza}
+    avertismente = set()
+    ocupat = {}
+    for opt in optionale_alese:
+        for ora in range(opt['OraStart'], opt['OraStop']):
+            for par in ('Impara', 'Para'):
+                if opt['Paritate'] not in ('Ambele', par): continue
+                cheie = (opt['Ziua'], ora, par)
+                existent = index.get((opt['Ziua'], ora))
+                celula_baza = existent[sg][par] if existent else ''
+                # un slot marcat "O1 (c) A | B | C" din orar este chiar locul optionalei, deci nu e conflict
+                slot_optional = bool(re.search(r'(^|\s)o[1-9][\s\.\(]', normalize_key(celula_baza))) or 'optional' in normalize_key(celula_baza)
+                if existent and este_materie(celula_baza) and not slot_optional and cheie not in ocupat:
+                    avertismente.add(f"'{opt['Nume']}' se suprapune cu '{scoate_sala_din_text(existent[sg][par])}' ({opt['Ziua'].capitalize()} {ora}-{ora+1})")
+                if cheie in ocupat and ocupat[cheie] != opt['Nume']:
+                    avertismente.add(f"'{opt['Nume']}' se suprapune cu '{ocupat[cheie]}' ({opt['Ziua'].capitalize()} {ora}-{ora+1})")
+                ocupat[cheie] = opt['Nume']
+    return sorted(avertismente)
 
 # ==========================================
 # 6. PROGRAM PRINCIPAL
 # ==========================================
-def main():
-    fisier = 'orar_curatat.xlsx'
+def main(fisier=None):
+    fisier = fisier or (sys.argv[1] if len(sys.argv) > 1 else 'orar_curatat.xlsx')
 
     grupa, anul = extrage_grupa_si_anul()
 
@@ -1030,13 +1470,11 @@ def main():
     este_engleza = grupa.endswith('G') or (grupa.endswith('F') and anul in ['3', '4'])
     traducator_activ = TRADUCATOR_EN if este_engleza else TRADUCATOR_RO
 
-    pagina_an = f"AN {anul}"
-    pagina_anunturi = f"Anunturi - AN{anul}"
-
     try:
+        pagina_an, pagina_anunturi = gaseste_foi(fisier, anul)
         are_semigrupe = grupa_are_semigrupe(fisier, pagina_an, grupa)
     except Exception as e:
-        print(f"\nEroare la citirea paginii '{pagina_an}'.")
+        print(f"\nEroare la citirea fisierului '{fisier}' (anul {anul}).")
         print(f"   Detaliu tehnic: {e}")
         return
 
@@ -1051,44 +1489,48 @@ def main():
 
     # PORNESTE FLUXUL DE PROCESARE
     try:
-        sali_extrase = extrage_sali_laborator(fisier, pagina_anunturi, grupa, traducator_activ)
-        meniu_optiuni = extrage_optiuni_disponibile(fisier, pagina_anunturi, grupa)
-        orar_baza = genereaza_orar_grupa(fisier, pagina_an, grupa, sali_extrase, traducator_activ)
+        sali_extrase = extrage_sali_laborator(fisier, pagina_anunturi, grupa, traducator_activ, semigrupa_utilizator)
+        orar_baza, pools = genereaza_orar_grupa(fisier, pagina_an, grupa, sali_extrase, traducator_activ)
+        meniu, fara_ora = construieste_meniu(fisier, pagina_anunturi, pools, grupa, semigrupa_utilizator)
     except Exception as e:
         print(f"\nEroare la citirea paginilor pentru Anul {anul}.")
-        print(f"   Verifica daca sheet-urile se numesc exact '{pagina_an}' si '{pagina_anunturi}'.")
+        print(f"   Verifica daca fisierul contine foile '{pagina_an}' si '{pagina_anunturi}'.")
         print(f"   Detaliu tehnic: {e}")
+        return
+
+    if not orar_baza:
+        print("\nNu s-a gasit orar pentru grupa specificata.")
         return
 
     optionale_alese_final = []
 
     # MENIURI OPTIONALE
-    dict_optionale = {k: v for k, v in meniu_optiuni.items() if v["Tip"] == "Optional"}
+    dict_optionale = {o['Id']: o for o in meniu if o['Tip'] == 'Optional'}
     if dict_optionale:
-        print("Acestea sunt optionalele disponibile pentru seria ta:")
-        for id_opt, detalii in dict_optionale.items():
-            print(f" [{id_opt}] {detalii['Nume']} | {detalii['Zi_Ora'].replace('/','').replace('  ', ' ')}")
-
+        print("\nAcestea sunt optionalele disponibile pentru grupa ta:")
+        afiseaza_meniu(meniu, 'Optional')
+        if fara_ora:
+            print("\n(Anuntate de secretariat, dar fara interval in orarul grupei tale: " + '; '.join(fara_ora) + ")")
         alegeri_opt = input("\nScrie numerele materiilor alese (ex: 1,3) sau Enter daca nu vrei: ")
         if alegeri_opt.strip():
             proceseaza_alegeri_meniu(alegeri_opt, dict_optionale, optionale_alese_final)
 
     # MENIURI FACULTATIVE
-    dict_facultative = {k: v for k, v in meniu_optiuni.items() if v["Tip"] == "Facultativ"}
+    dict_facultative = {o['Id']: o for o in meniu if o['Tip'] == 'Facultativ'}
     if dict_facultative:
-        rasp_fac = input("Doresti sa adaugi materii facultative? (Da/Nu): ").strip().lower()
+        rasp_fac = input("\nDoresti sa adaugi materii facultative? (Da/Nu): ").strip().lower()
 
         if rasp_fac == 'da':
-            for id_opt, detalii in dict_facultative.items():
-                print(f" [{id_opt}] {detalii['Nume']} | {detalii['Zi_Ora'].replace('/','').replace('  ', ' ')}")
-
+            afiseaza_meniu(meniu, 'Facultativ')
             alegeri_fac = input("\nScrie numerele alese: ")
             if alegeri_fac.strip():
                 proceseaza_alegeri_meniu(alegeri_fac, dict_facultative, optionale_alese_final)
 
-    if not orar_baza:
-        print("\nNu s-a gasit orar pentru grupa specificata.")
-        return
+    are_sg2_orar = any(este_materie(e['SG2'][p]) for e in orar_baza for p in ('Impara', 'Para'))
+    conflicte = detecteaza_conflicte(orar_baza, optionale_alese_final, semigrupa_utilizator, are_sg2_orar)
+    if conflicte:
+        print("\nATENTIE - suprapuneri in orar:")
+        for c in conflicte: print(f"  - {c}")
 
     # DATELE MERG SPRE EXCEL PENTRU EXPORTUL FINAL
     exporteaza_in_excel(orar_baza, optionale_alese_final, grupa, semigrupa_utilizator)
