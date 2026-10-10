@@ -1,3 +1,5 @@
+# This is Version 1.0 working for the 2025-2026 2nd semester Timetable. Check the other versions for an up-to-date code.
+
 # ETTI Timetable Generator
 
 A Python tool that parses the official ETTI UPB Excel timetable and generates a personalized, color-coded Excel schedule for a specific group and subgroup.
