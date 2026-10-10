@@ -1,4 +1,4 @@
-# This is Version 1.0 working for the 2025-2026 2nd semester Timetable. Check the other versions for an up-to-date code.
+# This is Version 1.0 working for the 2025-2026 2nd semester timetable. Check the other versions for an up-to-date code.
 
 # ETTI Timetable Generator
 
