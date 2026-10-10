@@ -1,4 +1,4 @@
-# ETTI Timetable Generator (OUTDATED, WORKING ON NEW UPDATE FOR THE NEW TIMETABLE)
+# ETTI Timetable Generator
 
 A Python tool that parses the official ETTI UPB Excel timetable and generates a personalized, color-coded Excel schedule for a specific group and subgroup.
 
